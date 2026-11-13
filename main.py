@@ -9,6 +9,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app import config
 from app.api.routes import router as planning_router
 
 app = FastAPI(
@@ -21,11 +22,20 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Enable CORS for frontend and orchestrator services
+# Enable CORS cleanly without combining wildcard origins with credentials
+allow_origins = list(
+    getattr(
+        config,
+        "CORS_ALLOW_ORIGINS",
+        ["http://localhost:3000", "http://localhost:8000"],
+    )
+)
+allow_credentials = "*" not in allow_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allow_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )

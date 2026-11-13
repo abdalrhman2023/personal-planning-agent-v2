@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.config import get_today_date_str
+
 
 # ---------------------------------------------------------------------------
 # 1. FixedLecture (inside study_data.university_schedule)
@@ -37,7 +39,28 @@ class StudyTask(BaseModel):
     scheduled_date: Optional[str] = None  # YYYY-MM-DD
     scheduled_start: Optional[str] = None  # HH:MM
     scheduled_end: Optional[str] = None  # HH:MM
-    gcal_event_id: Optional[str] = None
+    pinned_start: Optional[str] = None  # HH:MM hard-constraint start
+    pinned_end: Optional[str] = None  # HH:MM hard-constraint end
+    gcal_event_ids: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy_gcal_event_id(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            legacy_id = data.pop("gcal_event_id", None)
+            if legacy_id and not data.get("gcal_event_ids"):
+                data["gcal_event_ids"] = [legacy_id]
+        return data
+
+    @property
+    def gcal_event_id(self) -> Optional[str]:
+        """Backward-compatible single event ID accessor."""
+        return self.gcal_event_ids[0] if self.gcal_event_ids else None
+
+    @gcal_event_id.setter
+    def gcal_event_id(self, value: Optional[str]) -> None:
+        self.gcal_event_ids = [value] if value else []
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +95,7 @@ class ScheduleRequest(BaseModel):
     Supports either flat fields (tasks, university_schedule) or the nested
     study_data dictionary per the specification.
     """
-    target_date: str = "2026-11-02"
+    target_date: str = Field(default_factory=get_today_date_str)
     tasks: List[StudyTask] = Field(default_factory=list)
     university_schedule: List[FixedLecture] = Field(default_factory=list)
     gcal_busy_blocks: List[Dict[str, str]] = Field(default_factory=list)

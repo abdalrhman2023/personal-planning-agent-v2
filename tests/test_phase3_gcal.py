@@ -12,7 +12,7 @@ The test suite validates:
   H. Live-mode wiring (import-level, no network)
 """
 
-import os
+import importlib
 import pytest
 
 from app.integrations.gcal_service import GoogleCalendarService
@@ -227,9 +227,9 @@ class TestCRUDLifecycle:
 
     def test_multiple_events_independent(self, svc: GoogleCalendarService):
         """Creating / deleting one event should not affect others."""
-        e1 = svc.create_calendar_event("A", "2026-11-02", "08:00", "08:25")
+        svc.create_calendar_event("A", "2026-11-02", "08:00", "08:25")
         e2 = svc.create_calendar_event("B", "2026-11-02", "10:00", "10:25")
-        e3 = svc.create_calendar_event("C", "2026-11-02", "14:00", "14:25")
+        svc.create_calendar_event("C", "2026-11-02", "14:00", "14:25")
 
         svc.delete_calendar_event(e2["id"])
         blocks = svc.get_busy_blocks("2026-11-02")
@@ -275,6 +275,185 @@ class TestLiveModeWiring:
 
     def test_google_packages_importable(self):
         """google-api-python-client and google-auth-oauthlib must be installed."""
-        import googleapiclient.discovery  # noqa: F401
-        import google_auth_oauthlib.flow  # noqa: F401
-        import google.oauth2.credentials  # noqa: F401
+        assert importlib.import_module("googleapiclient.discovery") is not None
+        assert importlib.import_module("google_auth_oauthlib.flow") is not None
+        assert importlib.import_module("google.oauth2.credentials") is not None
+
+
+# ===================================================================
+# I. P1 – Config paths, Africa/Cairo bounds, delete fallbacks & timeout
+# ===================================================================
+
+class TestP1ConfigTimezoneAndResilience:
+    def test_reads_credentials_and_token_paths_from_config(self, tmp_path, monkeypatch):
+        import app.config as cfg
+
+        custom_creds = tmp_path / "custom_creds.json"
+        custom_token = tmp_path / "custom_token.json"
+        custom_creds.write_text('{"installed":{}}')
+        custom_token.write_text('{"token":"abc"}')
+        monkeypatch.setattr(cfg, "GOOGLE_CREDENTIALS_PATH", str(custom_creds))
+        monkeypatch.setattr(cfg, "GOOGLE_TOKEN_PATH", str(custom_token))
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        monkeypatch.delenv("GCAL_FORCE_MOCK", raising=False)
+
+        service = GoogleCalendarService()
+        assert service.mock_mode is False
+        assert service._credentials_path == str(custom_creds)
+        assert service._token_path == str(custom_token)
+
+    def test_date_bounds_rfc3339_uses_local_timezone_not_utc_z(self, monkeypatch):
+        import app.config as cfg
+        from app.integrations.gcal_service import _date_bounds_rfc3339
+
+        monkeypatch.setattr(cfg, "TIMEZONE", "Africa/Cairo")
+        time_min, time_max, _tz, tz_name = _date_bounds_rfc3339("2026-11-02")
+        assert time_min == "2026-11-02T00:00:00+02:00"
+        assert time_max == "2026-11-02T23:59:59+02:00"
+        assert tz_name == "Africa/Cairo"
+        assert not time_min.endswith("Z")
+        assert not time_max.endswith("Z")
+
+    def test_live_queries_use_cairo_bounds_and_safe_fallbacks(self, tmp_path, monkeypatch):
+        import app.config as cfg
+
+        monkeypatch.setattr(cfg, "TIMEZONE", "Africa/Cairo")
+        cred_file = tmp_path / "creds.json"
+        cred_file.write_text('{"installed":{}}')
+        service = GoogleCalendarService(credentials_path=str(cred_file))
+
+        recorded_freebusy_bodies = []
+        recorded_list_kwargs = []
+
+        class FakeExec:
+            def __init__(self, payload=None, exc=None):
+                self._payload = payload
+                self._exc = exc
+
+            def execute(self):
+                if self._exc:
+                    raise self._exc
+                return self._payload
+
+        class FakeFreebusyResource:
+            def __init__(self, fail=False):
+                self.fail = fail
+
+            def query(self, body):
+                recorded_freebusy_bodies.append(body)
+                if self.fail:
+                    return FakeExec(exc=RuntimeError("freebusy error"))
+                return FakeExec({
+                    "calendars": {
+                        "primary": {
+                            "busy": [
+                                {
+                                    "start": "2026-11-02T10:00:00+02:00",
+                                    "end": "2026-11-02T11:30:00+02:00",
+                                }
+                            ]
+                        }
+                    }
+                })
+
+        class FakeEventsResource:
+            def __init__(self, fail_list=False, fail_delete=False):
+                self.fail_list = fail_list
+                self.fail_delete = fail_delete
+                self.deleted_ids = []
+
+            def list(self, **kwargs):
+                recorded_list_kwargs.append(kwargs)
+                if self.fail_list:
+                    return FakeExec(exc=RuntimeError("list error"))
+                return FakeExec({
+                    "items": [
+                        {
+                            "id": "ev_live_1",
+                            "summary": "Deep Work",
+                            "start": {"dateTime": "2026-11-02T10:00:00+02:00"},
+                            "end": {"dateTime": "2026-11-02T11:30:00+02:00"},
+                        }
+                    ]
+                })
+
+            def delete(self, calendarId, eventId):
+                self.deleted_ids.append(eventId)
+                if self.fail_delete:
+                    return FakeExec(exc=RuntimeError("404 already deleted"))
+                return FakeExec({})
+
+        class FakeService:
+            def __init__(self, freebusy_res, events_res):
+                self._freebusy = freebusy_res
+                self._events = events_res
+
+            def freebusy(self):
+                return self._freebusy
+
+            def events(self):
+                return self._events
+
+        service._service = FakeService(FakeFreebusyResource(), FakeEventsResource())
+        blocks = service.get_busy_blocks("2026-11-02")
+        assert blocks == [{"start": "10:00", "end": "11:30"}]
+        assert recorded_freebusy_bodies[0]["timeMin"] == "2026-11-02T00:00:00+02:00"
+        assert recorded_freebusy_bodies[0]["timeMax"] == "2026-11-02T23:59:59+02:00"
+        assert recorded_freebusy_bodies[0]["timeZone"] == "Africa/Cairo"
+
+        deleted = service.clear_events_for_date("2026-11-02")
+        assert deleted == 1
+        assert recorded_list_kwargs[0]["timeMin"] == "2026-11-02T00:00:00+02:00"
+        assert recorded_list_kwargs[0]["timeMax"] == "2026-11-02T23:59:59+02:00"
+
+        # Fallback when list/delete fails in live mode
+        service._service = FakeService(
+            FakeFreebusyResource(fail=True),
+            FakeEventsResource(fail_list=True, fail_delete=True),
+        )
+        assert service.delete_calendar_event("missing_id") is False
+        assert service.clear_events_for_date("2026-11-02") == 0
+
+    def test_get_service_does_not_mutate_global_socket_timeout(self, tmp_path, monkeypatch):
+        import socket
+        import app.config as cfg
+        import google.oauth2.credentials as oauth_creds_mod
+        import googleapiclient.discovery as discovery_mod
+
+        cred_file = tmp_path / "creds.json"
+        token_file = tmp_path / "token.json"
+        cred_file.write_text('{"installed":{}}')
+        token_file.write_text('{"token":"abc"}')
+        monkeypatch.setattr(cfg, "GOOGLE_TOKEN_PATH", str(token_file))
+
+        class DummyCreds:
+            valid = True
+            expired = False
+            refresh_token = None
+
+            def to_json(self):
+                return '{"token":"abc"}'
+
+        captured_build_kwargs = {}
+
+        def fake_build(api, version, **kwargs):
+            captured_build_kwargs.update(kwargs)
+            return "fake_calendar_service"
+
+        monkeypatch.setattr(
+            oauth_creds_mod.Credentials,
+            "from_authorized_user_file",
+            lambda path, scopes: DummyCreds(),
+        )
+        monkeypatch.setattr(discovery_mod, "build", fake_build)
+
+        prev_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(42.0)
+        try:
+            service = GoogleCalendarService(credentials_path=str(cred_file))
+            result = service._get_service()
+            assert result == "fake_calendar_service"
+            assert socket.getdefaulttimeout() == 42.0
+            assert "http" in captured_build_kwargs
+        finally:
+            socket.setdefaulttimeout(prev_timeout)

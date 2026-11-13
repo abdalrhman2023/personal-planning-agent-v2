@@ -10,13 +10,15 @@ Implements the 5-step scheduling algorithm specified in the master plan:
 
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import re
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
+from app import config
 from app.schema import (
     AdaptiveModelContext,
-    FixedLecture,
     ScheduleRequest,
     ScheduleResult,
     ScheduledBlock,
@@ -160,15 +162,37 @@ def _prepare_tasks(
 # Slot allocation (Step 4)
 # ---------------------------------------------------------------------------
 
+def _consume_slot(
+    available: List[_Interval],
+    idx: int,
+    block_start: int,
+    block_end: int,
+) -> None:
+    """Remove [block_start, block_end) plus surrounding breaks from available[idx]."""
+    slot = available[idx]
+    left_end = block_start - _BREAK_MINS
+    right_start = block_end + _BREAK_MINS
+    left_piece = _Interval(slot.start, left_end) if left_end > slot.start else None
+    right_piece = _Interval(right_start, slot.end) if right_start < slot.end else None
+
+    available.pop(idx)
+    # Insert right first so indices stay correct when inserting left
+    if right_piece and right_piece.length > 0:
+        available.insert(idx, right_piece)
+    if left_piece and left_piece.length > 0:
+        available.insert(idx, left_piece)
+
+
 def _allocate_chunks(
     chunks: List[_TaskChunk],
     free_slots: List[_Interval],
     adaptive: AdaptiveModelContext,
     target_date: str,
-) -> Tuple[List[ScheduledBlock], List[str]]:
-    """Place chunks into free slots respecting cognitive windows and fatigue.
+    pinned_tasks: Optional[List[StudyTask]] = None,
+) -> Tuple[List[ScheduledBlock], List[str], List[str]]:
+    """Reserve hard-pinned tasks first, then place flexible chunks cleanly.
 
-    Returns (scheduled_blocks, unscheduled_task_ids).
+    Returns (scheduled_blocks, unscheduled_task_ids, pinned_conflict_ids).
     """
     peak = _parse_window(adaptive.peak_productivity_window)
     secondary = _parse_window(adaptive.secondary_productivity_window)
@@ -177,8 +201,57 @@ def _allocate_chunks(
     available = [_Interval(s.start, s.end) for s in free_slots]
     scheduled: List[ScheduledBlock] = []
     unscheduled_ids: List[str] = []
+    pinned_conflict_ids: List[str] = []
     daily_study_mins = 0
     max_daily = adaptive.max_daily_study_mins
+
+    # --- Reserve pinned tasks as hard time constraints first ---
+    for task in pinned_tasks or []:
+        if not task.pinned_start:
+            continue
+        try:
+            p_start = _hhmm_to_mins(task.pinned_start)
+            if task.pinned_end:
+                p_end = _hhmm_to_mins(task.pinned_end)
+            else:
+                dur = task.estimated_mins
+                if adaptive.current_system_mode == "PREEMPTIVE_RESTRUCTURE":
+                    dur = int(dur * adaptive.task_delay_factor)
+                p_end = p_start + dur
+        except ValueError:
+            unscheduled_ids.append(task.task_id)
+            pinned_conflict_ids.append(task.task_id)
+            continue
+
+        p_dur = p_end - p_start
+        if p_dur <= 0 or daily_study_mins + p_dur > max_daily:
+            unscheduled_ids.append(task.task_id)
+            pinned_conflict_ids.append(task.task_id)
+            continue
+
+        placed_idx: Optional[int] = None
+        for i, slot in enumerate(available):
+            if slot.start <= p_start and p_end <= slot.end:
+                placed_idx = i
+                break
+
+        if placed_idx is None:
+            unscheduled_ids.append(task.task_id)
+            pinned_conflict_ids.append(task.task_id)
+            continue
+
+        scheduled.append(
+            ScheduledBlock(
+                task_id=task.task_id,
+                title=task.title,
+                date=target_date,
+                start=_mins_to_hhmm(p_start),
+                end=_mins_to_hhmm(p_end),
+                part=1,
+            )
+        )
+        daily_study_mins += p_dur
+        _consume_slot(available, placed_idx, p_start, p_end)
 
     def _find_best_slot(chunk: _TaskChunk) -> Optional[Tuple[int, int]]:
         """Return (index_of_slot, start_minute) for the best placement, or None.
@@ -230,7 +303,6 @@ def _allocate_chunks(
             continue
 
         idx, block_start = result
-        slot = available[idx]
         block_end = block_start + chunk.duration_mins
 
         scheduled.append(
@@ -245,19 +317,10 @@ def _allocate_chunks(
         )
 
         daily_study_mins += chunk.duration_mins
+        _consume_slot(available, idx, block_start, block_end)
 
-        # Consume the slot: remove the used portion + break gap.
-        # If the block starts in the middle of a slot, keep the left piece.
-        consumed_end = block_end + _BREAK_MINS
-        left_piece = _Interval(slot.start, block_start) if block_start > slot.start else None
-        right_piece = _Interval(consumed_end, slot.end) if consumed_end < slot.end else None
-
-        available.pop(idx)
-        # Insert right first so indices stay correct when inserting left
-        if right_piece and right_piece.length > 0:
-            available.insert(idx, right_piece)
-        if left_piece and left_piece.length > 0:
-            available.insert(idx, left_piece)
+    # Sort chronologically by start time ascending
+    scheduled.sort(key=lambda b: (_hhmm_to_mins(b.start), _hhmm_to_mins(b.end), b.task_id, b.part))
 
     # De-duplicate unscheduled (a multi-chunk task may appear multiple times)
     seen = set()
@@ -267,7 +330,40 @@ def _allocate_chunks(
             seen.add(tid)
             unique_unscheduled.append(tid)
 
-    return scheduled, unique_unscheduled
+    return scheduled, unique_unscheduled, pinned_conflict_ids
+
+
+# ---------------------------------------------------------------------------
+# Timezone & Deadline helpers
+# ---------------------------------------------------------------------------
+
+def _get_configured_tz() -> ZoneInfo | timezone:
+    """Return configured ZoneInfo (default Africa/Cairo) with UTC fallback."""
+    tz_name = getattr(config, "TIMEZONE", "Africa/Cairo")
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return timezone.utc
+
+
+def _parse_deadline_dt(deadline_str: str, tz: ZoneInfo | timezone) -> Optional[datetime]:
+    """Parse date-only ('YYYY-MM-DD') or ISO deadline string into timezone-aware datetime.
+
+    Date-only deadlines map to 23:59:59 on that date in *tz* to avoid naive vs aware
+    comparison errors and treat the full day as valid.
+    """
+    raw = (deadline_str or "").strip()
+    if not raw:
+        return None
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            return datetime.fromisoformat(f"{raw}T23:59:59").replace(tzinfo=tz)
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=tz)
+        return dt.astimezone(tz)
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -301,25 +397,53 @@ def optimize_schedule(request: ScheduleRequest) -> ScheduleResult:
             _Interval(_hhmm_to_mins(blk["start"]), _hhmm_to_mins(blk["end"]))
         )
 
-    all_busy = sorted(lecture_blocks + gcal_blocks, key=lambda b: b.start)
+    # Subtract already-scheduled study tasks on target_date (with breaks)
+    scheduled_task_blocks: List[_Interval] = []
+    for t in request.tasks:
+        if t.status == "scheduled" and t.scheduled_start and t.scheduled_end:
+            if t.scheduled_date is None or t.scheduled_date == target_date:
+                try:
+                    s_min = _hhmm_to_mins(t.scheduled_start)
+                    e_min = _hhmm_to_mins(t.scheduled_end)
+                    if e_min > s_min:
+                        scheduled_task_blocks.append(
+                            _Interval(
+                                max(_DAY_START, s_min - _BREAK_MINS),
+                                min(_DAY_END, e_min + _BREAK_MINS),
+                            )
+                        )
+                except ValueError:
+                    pass
+
+    all_busy = sorted(
+        lecture_blocks + gcal_blocks + scheduled_task_blocks,
+        key=lambda b: b.start,
+    )
     free_slots = _subtract_intervals(free_slots, all_busy)
 
-    # --- Steps 2 & 3: Prepare task chunks ---
+    # --- Steps 2 & 3: Prepare task chunks (flexible) & hard-pinned tasks ---
     pending_tasks = [t for t in request.tasks if t.status == "pending"]
-    chunks = _prepare_tasks(pending_tasks, adaptive)
+    pinned_tasks = [t for t in pending_tasks if t.pinned_start]
+    flex_tasks = [t for t in pending_tasks if not t.pinned_start]
+    chunks = _prepare_tasks(flex_tasks, adaptive)
 
     # --- Step 4: Allocate ---
-    scheduled_blocks, unscheduled_ids = _allocate_chunks(
-        chunks, free_slots, adaptive, target_date
+    scheduled_blocks, unscheduled_ids, pinned_conflict_ids = _allocate_chunks(
+        chunks, free_slots, adaptive, target_date, pinned_tasks=pinned_tasks
     )
 
     # --- Step 5: Feasibility Verification ---
-    is_feasible = len(unscheduled_ids) == 0
+    tz = _get_configured_tz()
+    blocks_by_task: Dict[str, List[ScheduledBlock]] = {}
+    for blk in scheduled_blocks:
+        blocks_by_task.setdefault(blk.task_id, []).append(blk)
 
-    # Check deadline violations for scheduled tasks
+    # Check deadline violations for BOTH unscheduled AND scheduled tasks
     deadline_violations: List[dict] = []
     for task in pending_tasks:
-        if task.deadline and task.task_id in unscheduled_ids:
+        if not task.deadline:
+            continue
+        if task.task_id in unscheduled_ids:
             deadline_violations.append(
                 {
                     "task_id": task.task_id,
@@ -328,6 +452,35 @@ def optimize_schedule(request: ScheduleRequest) -> ScheduleResult:
                     "reason": "Could not schedule before deadline – insufficient free slots or daily study cap reached.",
                 }
             )
+            continue
+
+        deadline_dt = _parse_deadline_dt(task.deadline, tz)
+        if deadline_dt is None:
+            continue
+
+        late_blocks = []
+        for blk in blocks_by_task.get(task.task_id, []):
+            end_dt = datetime.fromisoformat(f"{blk.date}T{blk.end}:00").replace(tzinfo=tz)
+            if end_dt > deadline_dt:
+                late_blocks.append(blk)
+
+        if late_blocks:
+            latest_blk = max(late_blocks, key=lambda b: (b.date, b.end))
+            deadline_violations.append(
+                {
+                    "task_id": task.task_id,
+                    "title": task.title,
+                    "deadline": task.deadline,
+                    "scheduled_date": latest_blk.date,
+                    "scheduled_end": latest_blk.end,
+                    "reason": (
+                        f"Scheduled block ends at {latest_blk.date} {latest_blk.end}, "
+                        f"exceeding task deadline {task.deadline}."
+                    ),
+                }
+            )
+
+    is_feasible = (len(unscheduled_ids) == 0) and (len(deadline_violations) == 0)
 
     feasibility_flags = None
     if not is_feasible:
@@ -335,10 +488,11 @@ def optimize_schedule(request: ScheduleRequest) -> ScheduleResult:
             "is_feasible": False,
             "unscheduled_task_ids": unscheduled_ids,
             "deadline_violations": deadline_violations,
+            "pinned_conflicts": pinned_conflict_ids,
             "message": (
-                "Schedule is infeasible: some tasks could not be placed. "
-                "Consider extending deadlines, reducing workload, or "
-                "increasing max_daily_study_mins."
+                "Schedule is infeasible: some tasks could not be placed or finish after their deadline. "
+                "Consider extending deadlines, resolving pinned-slot conflicts, "
+                "reducing workload, or increasing max_daily_study_mins."
             ),
         }
 

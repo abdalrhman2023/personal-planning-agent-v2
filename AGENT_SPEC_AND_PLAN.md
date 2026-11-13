@@ -10,7 +10,7 @@ Follow these strict rules:
    - Task Deconstruction (splitting large tasks into micro-tasks matching the student's focus duration)[cite: 1].
    - Calling deterministic Python tools: create_task(), reschedule_block(), optimize_schedule()[cite: 1].
    All actual time-slot allocation and conflict resolution MUST happen inside the Python algorithmic solver (app/engine/optimizer.py).
-4. MODEL CONFIGURATION: Load GEMINI_API_KEY and GEMINI_MODEL_NAME (defaulting to "gemini-3.8-flash" or whatever is set in .env) from app/config.py. Never hardcode model names.
+4. MODEL CONFIGURATION: Load GEMINI_API_KEY and GEMINI_MODEL_NAME (defaulting to "gemini-3.5-flash" or whatever is set in .env) from app/config.py. Never hardcode model names.
 5. TEST VERIFICATION: At the end of each phase, run pytest in the terminal and ensure 100% pass rate.
 
 ---

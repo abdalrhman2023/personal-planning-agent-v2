@@ -15,16 +15,10 @@ Tests cover:
 """
 
 import json
-import pytest
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app.schema import (
-    AdaptiveModelContext,
-    FixedLecture,
-    ScheduleResult,
-    StudyTask,
-)
+from app.schema import AdaptiveModelContext
 from app.agent.tools import (
     ALL_TOOLS,
     create_task,
@@ -494,3 +488,182 @@ class TestGraphBuild:
                     "optimizer_and_gcal", "telemetry_and_signals"}
         # LangGraph adds __start__ and __end__ nodes
         assert expected.issubset(node_names)
+
+
+class TestP0RescheduleStateDirtyAndToolLoop:
+    def test_pure_chat_skips_optimizer_and_gcal(self, monkeypatch):
+        """Pure conversational messages without task mutation set state_dirty=False and skip optimizer."""
+        monkeypatch.setattr("app.config.GEMINI_API_KEY", "")
+        graph = build_graph()
+        initial = {
+            "messages": [HumanMessage(content="Hello, how does Pomodoro work?")],
+            "entry_mode": "chat",
+            "target_date": "2026-11-02",
+            "tasks": [_task_dict()],
+            "adaptive_model": AdaptiveModelContext().model_dump(),
+        }
+        result = graph.invoke(initial)
+        assert result["state_dirty"] is False
+        assert result.get("schedule_result") is None
+        assert result.get("gcal_events_created", []) == []
+
+    def test_nl_reschedule_english_and_arabic_and_swagger_example(self, monkeypatch):
+        """Natural language reschedule ('move', 'reschedule', 'انقل') pins time and reschedules cleanly."""
+        monkeypatch.setattr("app.config.GEMINI_API_KEY", "")
+        graph = build_graph()
+
+        # Swagger example payload flow
+        res_en = graph.invoke({
+            "messages": [HumanMessage(content="Move my evening study session to 19:30")],
+            "entry_mode": "chat",
+            "target_date": "2026-11-13",
+            "tasks": [_task_dict(task_id="task_algo", title="Algorithms Practice", estimated_mins=25, status="scheduled")],
+            "adaptive_model": AdaptiveModelContext().model_dump(),
+        })
+        assert res_en["schedule_result"] is not None
+        assert res_en["schedule_result"]["is_feasible"] is True
+        blocks_en = res_en["schedule_result"]["scheduled_blocks"]
+        assert len(blocks_en) == 1
+        assert blocks_en[0]["start"] == "19:30"
+        assert blocks_en[0]["end"] == "19:55"
+        assert res_en["tasks"][0]["pinned_start"] == "19:30"
+        assert res_en["tasks"][0]["status"] == "scheduled"
+        assert len(res_en["tasks"][0]["gcal_event_ids"]) == 1
+
+        # Arabic command
+        res_ar = graph.invoke({
+            "messages": [HumanMessage(content="انقل مذاكرة Algorithms للساعة 8 مساءً")],
+            "entry_mode": "chat",
+            "target_date": "2026-11-14",
+            "tasks": [_task_dict(task_id="task_algo", title="Algorithms Practice", estimated_mins=25, status="scheduled")],
+            "adaptive_model": AdaptiveModelContext().model_dump(),
+        })
+        blocks_ar = res_ar["schedule_result"]["scheduled_blocks"]
+        assert blocks_ar[0]["start"] == "20:00"
+        assert blocks_ar[0]["end"] == "20:25"
+
+    def test_multi_chunk_gcal_event_ids_all_stored(self):
+        """A multi-chunk task stores ALL created GCal event IDs in gcal_event_ids, not just the last one."""
+        s = _state(
+            tasks=[_task_dict(task_id="multi1", estimated_mins=50)],
+            adaptive_model=AdaptiveModelContext(effective_focus_duration_mins=25).model_dump(),
+        )
+        updates = optimizer_and_gcal_node(s)
+        t = updates["tasks"][0]
+        assert len(t["gcal_event_ids"]) == 2
+        assert t["scheduled_start"] < t["scheduled_end"]
+
+    def test_llm_context_injection_and_tool_loop_closed(self, monkeypatch):
+        """LLM receives current state context and ToolMessage loop closes into clean AIMessage."""
+        captured_prompts = []
+
+        class FakeBoundLLM:
+            def invoke(self, conv):
+                captured_prompts.append(conv)
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "reschedule_block",
+                            "args": {
+                                "task_id": "task_algo",
+                                "new_start": "20:00",
+                                "new_end": "20:25",
+                            },
+                            "id": "call_resched_1",
+                        }
+                    ],
+                )
+
+        class FakeLLM:
+            def __init__(self, **kwargs):
+                pass
+
+            def bind_tools(self, tools):
+                return FakeBoundLLM()
+
+            def invoke(self, conv):
+                # Follow-up turn receives SystemMessage + HumanMessage + AIMessage + ToolMessage
+                captured_prompts.append(conv)
+                return AIMessage(content="Moved Algorithms Practice to 20:00-20:25.")
+
+        import sys
+        import types
+
+        fake_mod = types.ModuleType("langchain_google_genai")
+        fake_mod.ChatGoogleGenerativeAI = FakeLLM
+        monkeypatch.setitem(sys.modules, "langchain_google_genai", fake_mod)
+        monkeypatch.setattr("app.config.GEMINI_API_KEY", "test-fake-key")
+
+        graph = build_graph()
+        res = graph.invoke({
+            "messages": [HumanMessage(content="Move Algorithms to 20:00")],
+            "entry_mode": "chat",
+            "target_date": "2026-11-14",
+            "tasks": [_task_dict(task_id="task_algo", title="Algorithms Practice", status="scheduled")],
+            "adaptive_model": AdaptiveModelContext().model_dump(),
+        })
+
+        # Verify state context was injected in initial SystemMessage
+        sys_msg_text = captured_prompts[0][0].content
+        assert "task_algo" in sys_msg_text
+        assert "2026-11-14" in sys_msg_text
+
+        # Verify follow-up turn received ToolMessage with applied=True and closed with clean AIMessage
+        assert any(isinstance(m, AIMessage) and "20:00-20:25" in m.content for m in res["messages"])
+        assert res["schedule_result"]["scheduled_blocks"][0]["start"] == "20:00"
+        assert res["schedule_result"]["scheduled_blocks"][0]["end"] == "20:25"
+
+    def test_life_coach_milestone_uses_llm_deconstruction_and_inherits_topic_ref(self, monkeypatch):
+        """P2: graph.py invokes LLM deconstructor without force_fallback and preserves topic_ref fallback."""
+        import sys
+        import types
+        from app.engine.deconstructor import DeconstructionResult, MicroTask
+
+        class FakeStructured:
+            def invoke(self, messages):
+                return DeconstructionResult(
+                    parent_task_id="ms1",
+                    parent_title="Neural Nets Milestone",
+                    micro_tasks=[
+                        MicroTask(title="Backprop Theory", estimated_mins=30, cognitive_load="high", topic_ref=None),
+                        MicroTask(title="PyTorch Lab", estimated_mins=30, cognitive_load="high", topic_ref="CS401_Lab"),
+                    ],
+                )
+
+        class FakeLLM:
+            def __init__(self, **kwargs):
+                pass
+
+            def with_structured_output(self, schema):
+                return FakeStructured()
+
+        fake_mod = types.ModuleType("langchain_google_genai")
+        fake_mod.ChatGoogleGenerativeAI = FakeLLM
+        monkeypatch.setitem(sys.modules, "langchain_google_genai", fake_mod)
+        monkeypatch.setattr("app.config.GEMINI_API_KEY", "test-fake-key")
+
+        payload = json.dumps({
+            "signal_type": "MILESTONE_TASKS",
+            "milestones": [
+                {
+                    "task_id": "ms1",
+                    "title": "Neural Nets Milestone",
+                    "estimated_mins": 60,
+                    "priority_weight": 4.0,
+                    "cognitive_load": "high",
+                    "topic_ref": "CS401_NN",
+                }
+            ],
+        })
+        s = _state(
+            entry_mode="control_signal",
+            messages=[HumanMessage(content=payload)],
+            tasks=[],
+            adaptive_model={"effective_focus_duration_mins": 30},
+        )
+        updates = deconstructor_or_tool_llm_node(s)
+        assert len(updates["tasks"]) == 2
+        assert updates["tasks"][0]["title"] == "Backprop Theory"
+        assert updates["tasks"][0]["topic_ref"] == "CS401_NN"
+        assert updates["tasks"][1]["topic_ref"] == "CS401_Lab"

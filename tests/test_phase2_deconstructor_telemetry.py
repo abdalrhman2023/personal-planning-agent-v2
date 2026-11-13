@@ -3,7 +3,6 @@
 import pytest
 
 from app.schema import (
-    AdaptiveModelContext,
     FixedLecture,
     OutboundSignals,
     ScheduledBlock,
@@ -123,6 +122,50 @@ class TestWorkloadDensity:
         }
         assert set(result.keys()) == expected_keys
 
+    def test_density_filters_gcal_by_target_date(self):
+        """GCal busy blocks explicitly on another date must not reduce free time."""
+        gcal = [
+            {"date": "2026-11-03", "start": "09:00", "end": "12:00"},
+            {"start": "2026-11-04T10:00:00+02:00", "end": "2026-11-04T12:00:00+02:00"},
+            {"start": "14:00", "end": "15:00"},  # implicitly target_date
+        ]
+        result = compute_workload_density([], [], gcal, "2026-11-02")
+        assert result["gcal_busy_mins"] == 60
+        assert result["total_free_mins"] == 840 - 60
+
+    def test_density_merges_overlapping_lecture_and_gcal_intervals(self):
+        """Overlapping lecture and GCal event must not be double-counted."""
+        lec = FixedLecture(
+            id="l1", day="Mon", date="2026-11-02",
+            start="09:00", end="11:00", title="Algorithms",
+        )
+        # Same lecture synced in GCal 10:00-12:00 -> union is 09:00-12:00 (180 mins)
+        gcal = [{"date": "2026-11-02", "start": "10:00", "end": "12:00"}]
+        blocks = [_block(start="13:00", end="14:00")]
+        result = compute_workload_density(
+            scheduled_blocks=blocks,
+            university_schedule=[lec],
+            gcal_busy_blocks=gcal,
+            target_date="2026-11-02",
+        )
+        assert result["lecture_mins"] == 120
+        assert result["gcal_busy_mins"] == 120
+        assert result["total_free_mins"] == 840 - 180
+        assert result["workload_density"] == pytest.approx(60 / (840 - 180), abs=0.001)
+
+    def test_density_clips_to_operating_window_and_cross_midnight(self):
+        """Events extending outside 08:00-22:00 or across midnight clip accurately."""
+        gcal = [
+            {"date": "2026-11-02", "start": "06:00", "end": "09:00"},  # clips to 08:00-09:00 (60m)
+            {
+                "start": "2026-11-02T20:30:00+02:00",
+                "end": "2026-11-03T01:00:00+02:00",  # clips to 20:30-22:00 (90m)
+            },
+        ]
+        result = compute_workload_density([], [], gcal, "2026-11-02")
+        assert result["gcal_busy_mins"] == 150
+        assert result["total_free_mins"] == 840 - 150
+
 
 # ===================================================================
 # B. Velocity Slip Detection
@@ -192,6 +235,59 @@ class TestVelocitySlip:
         assert result["attempted_count"] == 1
         assert result["completed_count"] == 1
         assert result["slip_ratio"] == 0.0
+
+    def test_future_scheduled_task_does_not_trigger_velocity_slip(self):
+        """Freshly scheduled tasks whose end time has NOT passed yet must not count as slip."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        now_cairo = datetime(2026, 11, 13, 10, 0, tzinfo=ZoneInfo("Africa/Cairo"))
+        tasks = [
+            _task(
+                task_id="future_today",
+                status="scheduled",
+                scheduled_date="2026-11-13",
+                scheduled_end="14:00",
+            ),
+            _task(
+                task_id="future_tomorrow",
+                status="scheduled",
+                scheduled_date="2026-11-14",
+                scheduled_end="09:00",
+            ),
+        ]
+        result = compute_velocity_slip(tasks, now=now_cairo)
+        assert result["attempted_count"] == 0
+        assert result["slip_ratio"] == 0.0
+        assert result["deviation_exceeded"] is False
+        assert result["alert_payload"] is None
+
+    def test_overdue_scheduled_task_counts_in_velocity_slip(self):
+        """Scheduled tasks whose end time <= now (or on a past date) DO count if not completed."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        now_cairo = datetime(2026, 11, 13, 15, 0, tzinfo=ZoneInfo("Africa/Cairo"))
+        tasks = [
+            _task(
+                task_id="overdue_today",
+                status="scheduled",
+                scheduled_date="2026-11-13",
+                scheduled_end="14:00",
+            ),
+            _task(
+                task_id="overdue_yesterday",
+                status="scheduled",
+                scheduled_date="2026-11-12",
+                scheduled_end="21:00",
+            ),
+        ]
+        result = compute_velocity_slip(tasks, now=now_cairo)
+        assert result["attempted_count"] == 2
+        assert result["completed_count"] == 0
+        assert result["slip_ratio"] == 1.0
+        assert result["deviation_exceeded"] is True
+        assert result["alert_payload"]["signal_type"] == "VELOCITY_SLIP_ALERT"
 
 
 # ===================================================================
@@ -288,6 +384,34 @@ class TestOutboundSignals:
         # No feasibility issue → no life coach signal
         assert signals.to_life_coach is None
 
+    def test_simultaneous_feasibility_and_velocity_slip_not_swallowed(self):
+        """P1: Both feasibility issues and velocity slip must surface together."""
+        tasks = (
+            [_task(task_id=f"c{i}", status="completed") for i in range(2)]
+            + [_task(task_id=f"m{i}", status="missed") for i in range(8)]
+        )
+        signals = compute_outbound_signals(
+            scheduled_blocks=[],
+            tasks=tasks,
+            university_schedule=[],
+            gcal_busy_blocks=[],
+            target_date="2026-11-02",
+            feasibility_flags={
+                "signal_type": "FEASIBILITY_INFEASIBLE",
+                "flags": ["DEADLINE_VIOLATION: task m0"],
+            },
+        )
+        assert signals.to_life_coach is not None
+        assert signals.to_life_coach["signal_type"] == "MILESTONE_FEASIBILITY_REPORT"
+        assert signals.to_adaptive_manager is not None
+        assert signals.to_adaptive_manager["signal_type"] == "FEASIBILITY_INFEASIBLE"
+        assert "velocity_slip_alert" in signals.to_adaptive_manager
+        assert signals.to_adaptive_manager["velocity_slip_alert"]["signal_type"] == "VELOCITY_SLIP_ALERT"
+        assert signals.to_adaptive_manager["active_signals"] == [
+            "FEASIBILITY_INFEASIBLE",
+            "VELOCITY_SLIP_ALERT",
+        ]
+
 
 # ===================================================================
 # E. Deterministic Fallback Splitter
@@ -366,6 +490,129 @@ class TestDeconstructTask:
         assert hasattr(config, "GEMINI_MODEL_NAME")
         assert isinstance(config.GEMINI_MODEL_NAME, str)
         assert len(config.GEMINI_MODEL_NAME) > 0
+
+    def test_llm_deconstruct_primary_model_succeeds(self, monkeypatch):
+        """P2: Primary Gemini model succeeds and sets parent metadata cleanly."""
+        import sys
+        import types
+
+        invoked_models = []
+
+        class FakeStructured:
+            def invoke(self, messages):
+                return DeconstructionResult(
+                    parent_task_id="ignored",
+                    parent_title="ignored",
+                    micro_tasks=[
+                        MicroTask(title="Step A", estimated_mins=30, cognitive_load="high", topic_ref="dl_1"),
+                        MicroTask(title="Step B", estimated_mins=30, cognitive_load="medium", topic_ref="dl_2"),
+                    ],
+                )
+
+        class FakeLLM:
+            def __init__(self, model, **kwargs):
+                invoked_models.append(model)
+
+            def with_structured_output(self, schema):
+                return FakeStructured()
+
+        fake_mod = types.ModuleType("langchain_google_genai")
+        fake_mod.ChatGoogleGenerativeAI = FakeLLM
+        monkeypatch.setitem(sys.modules, "langchain_google_genai", fake_mod)
+        monkeypatch.setattr("app.config.GEMINI_API_KEY", "test-fake-key")
+        monkeypatch.setattr("app.config.GEMINI_MODEL_NAME", "primary-gemini")
+        monkeypatch.setattr("app.config.GEMINI_FALLBACK_MODEL_NAME", "fallback-gemini")
+
+        task = _task(task_id="big_dl", title="Deep Learning Project", estimated_mins=60)
+        res = deconstruct_task(task, focus_duration_mins=30)
+        assert invoked_models == ["primary-gemini"]
+        assert res.parent_task_id == "big_dl"
+        assert res.parent_title == "Deep Learning Project"
+        assert [mt.title for mt in res.micro_tasks] == ["Step A", "Step B"]
+
+    def test_llm_deconstruct_fallback_model_used_when_primary_invoke_fails(self, monkeypatch):
+        """P2: When primary model invoke fails, fallback model in candidate_models succeeds."""
+        import sys
+        import types
+
+        invoked_models = []
+
+        class FakeStructured:
+            def __init__(self, model_name):
+                self._model = model_name
+
+            def invoke(self, messages):
+                if self._model == "primary-gemini":
+                    raise RuntimeError("404 primary model unavailable")
+                return DeconstructionResult(
+                    parent_task_id="big_fb",
+                    parent_title="Fallback Topic",
+                    micro_tasks=[
+                        MicroTask(title="Part X", estimated_mins=25, cognitive_load="high"),
+                        MicroTask(title="Part Y", estimated_mins=25, cognitive_load="medium"),
+                    ],
+                )
+
+        class FakeLLM:
+            def __init__(self, model, **kwargs):
+                self._model = model
+                invoked_models.append(model)
+
+            def with_structured_output(self, schema):
+                return FakeStructured(self._model)
+
+        fake_mod = types.ModuleType("langchain_google_genai")
+        fake_mod.ChatGoogleGenerativeAI = FakeLLM
+        monkeypatch.setitem(sys.modules, "langchain_google_genai", fake_mod)
+        monkeypatch.setattr("app.config.GEMINI_API_KEY", "test-fake-key")
+        monkeypatch.setattr("app.config.GEMINI_MODEL_NAME", "primary-gemini")
+        monkeypatch.setattr("app.config.GEMINI_FALLBACK_MODEL_NAME", "fallback-gemini")
+
+        task = _task(task_id="big_fb", title="Fallback Topic", estimated_mins=50)
+        res = deconstruct_task(task, focus_duration_mins=25)
+        assert invoked_models == ["primary-gemini", "fallback-gemini"]
+        assert [mt.title for mt in res.micro_tasks] == ["Part X", "Part Y"]
+
+    def test_llm_deconstruct_falls_back_to_deterministic_split_when_all_models_fail(self, monkeypatch):
+        """P2: If all candidate models fail on invoke, safely degrade to _deterministic_split."""
+        import sys
+        import types
+
+        invoked_models = []
+
+        class FakeStructured:
+            def invoke(self, messages):
+                raise RuntimeError("API quota exhausted")
+
+        class FakeLLM:
+            def __init__(self, model, **kwargs):
+                invoked_models.append(model)
+
+            def with_structured_output(self, schema):
+                return FakeStructured()
+
+        fake_mod = types.ModuleType("langchain_google_genai")
+        fake_mod.ChatGoogleGenerativeAI = FakeLLM
+        monkeypatch.setitem(sys.modules, "langchain_google_genai", fake_mod)
+        monkeypatch.setattr("app.config.GEMINI_API_KEY", "test-fake-key")
+        monkeypatch.setattr("app.config.GEMINI_MODEL_NAME", "primary-gemini")
+        monkeypatch.setattr("app.config.GEMINI_FALLBACK_MODEL_NAME", "fallback-gemini")
+
+        task = _task(task_id="big_det", title="Algorithms Chapter", estimated_mins=50)
+        res = deconstruct_task(task, focus_duration_mins=25)
+        assert invoked_models == ["primary-gemini", "fallback-gemini"]
+        assert len(res.micro_tasks) == 2
+        assert sum(mt.estimated_mins for mt in res.micro_tasks) == 50
+        assert "Part 1/2" in res.micro_tasks[0].title
+
+    def test_unmocked_live_llm_suppressed_during_pytest_even_with_api_key(self, monkeypatch):
+        """P2: Under PYTEST_CURRENT_TEST with an unmocked client, no network call runs."""
+        monkeypatch.setattr("app.config.GEMINI_API_KEY", "sk-real-looking-key")
+        monkeypatch.setenv("PYTEST_CURRENT_TEST", "tests/test_phase2.py::test_suppression")
+        task = _task(task_id="offline_guard", title="Linear Algebra", estimated_mins=50)
+        res = deconstruct_task(task, focus_duration_mins=25)
+        assert len(res.micro_tasks) == 2
+        assert sum(mt.estimated_mins for mt in res.micro_tasks) == 50
 
 
 # ===================================================================

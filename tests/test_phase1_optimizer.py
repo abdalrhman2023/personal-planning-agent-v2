@@ -7,8 +7,6 @@ from app.schema import (
     AdaptiveModelContext,
     FixedLecture,
     ScheduleRequest,
-    ScheduleResult,
-    ScheduledBlock,
     StudyTask,
     OutboundSignals,
 )
@@ -449,3 +447,202 @@ class TestIntegrationScenario:
         for block in res.scheduled_blocks:
             duration = _hhmm_to_mins(block.end) - _hhmm_to_mins(block.start)
             assert duration <= 25
+
+
+class TestPinnedConstraintsAndBreaks:
+    def test_pinned_task_placed_first_with_breaks_and_chronological_sort(self):
+        """Pinned task holds exact requested time, leaves 10-min break on BOTH left and right, and result is sorted."""
+        pinned = _make_task(
+            task_id="pin1",
+            title="Evening Pinned Session",
+            estimated_mins=25,
+            pinned_start="10:00",
+            pinned_end="10:25",
+            cognitive_load="low",
+        )
+        flex1 = _make_task(
+            task_id="flex1",
+            title="Morning Slot Before Pinned",
+            estimated_mins=70,  # wait: high -> peak 09:00-11:00; with 25 focus, 09:00-09:25 and 09:35-09:50!
+            priority_weight=4.0,
+            cognitive_load="high",
+        )
+        req = _make_request(
+            tasks=[flex1, pinned],
+            adaptive_overrides={
+                "effective_focus_duration_mins": 25,
+                "peak_productivity_window": "09:00-11:00",
+                "secondary_productivity_window": "19:00-22:00",
+            },
+        )
+        res = optimize_schedule(req)
+        assert res.is_feasible is True
+
+        # Check pinned block exact coordinates
+        pin_blocks = [b for b in res.scheduled_blocks if b.task_id == "pin1"]
+        assert len(pin_blocks) == 1
+        assert pin_blocks[0].start == "10:00"
+        assert pin_blocks[0].end == "10:25"
+
+        # Check chronological ascending order and >= 10 min breaks between ALL adjacent blocks
+        starts = [_hhmm_to_mins(b.start) for b in res.scheduled_blocks]
+        assert starts == sorted(starts)
+        for prev, nxt in zip(res.scheduled_blocks, res.scheduled_blocks[1:]):
+            assert _hhmm_to_mins(nxt.start) - _hhmm_to_mins(prev.end) >= 10
+
+    def test_left_piece_respects_break_when_block_shifted_to_peak(self):
+        """When a block shifts to peak start (e.g. 10:00), earlier block must stop <= 09:50."""
+        # Peak starts at 09:15; free slot starts at 08:50. Flex low fits if it can squeeze before peak.
+        # Put lecture 08:00-09:00; peak=09:30-11:00; high task takes 09:30-09:55 -> left piece is [09:00, 09:20] (20m)
+        lec = FixedLecture(
+            id="l1", day="Mon", date="2026-11-02",
+            start="08:00", end="09:00", title="Morning Lecture",
+        )
+        high_task = _make_task(task_id="high1", cognitive_load="high", estimated_mins=25, priority_weight=5.0)
+        low_25 = _make_task(task_id="low25", cognitive_load="low", estimated_mins=25, priority_weight=1.0)
+        req = _make_request(
+            tasks=[high_task, low_25],
+            lectures=[lec],
+            adaptive_overrides={
+                "peak_productivity_window": "09:30-10:00",
+                "secondary_productivity_window": "09:00-09:30",  # Forces low_25 to try 09:00-09:30
+                "effective_focus_duration_mins": 25,
+            },
+        )
+        res = optimize_schedule(req)
+        b_low = next(b for b in res.scheduled_blocks if b.task_id == "low25")
+        b_high = next(b for b in res.scheduled_blocks if b.task_id == "high1")
+        assert b_high.start == "09:30"
+        # low25 CANNOT be placed at 09:00-09:25 because that violates 10-min break before 09:30!
+        assert _hhmm_to_mins(b_low.start) >= 605 or _hhmm_to_mins(b_low.end) <= 560
+
+    def test_pinned_conflict_with_lecture_is_infeasible(self):
+        lec = FixedLecture(
+            id="l1", day="Mon", date="2026-11-02",
+            start="09:00", end="10:30", title="Physics",
+        )
+        pinned = _make_task(
+            task_id="pin_bad",
+            pinned_start="09:30",
+            pinned_end="10:00",
+            estimated_mins=30,
+        )
+        req = _make_request(tasks=[pinned], lectures=[lec])
+        res = optimize_schedule(req)
+        assert res.is_feasible is False
+        assert "pin_bad" in res.unscheduled_tasks
+        assert "pin_bad" in res.feasibility_flags["pinned_conflicts"]
+
+    def test_legacy_gcal_event_id_property_backward_compatible(self):
+        t = _make_task(gcal_event_id="ev_single")
+        assert t.gcal_event_ids == ["ev_single"]
+        assert t.gcal_event_id == "ev_single"
+        t2 = _make_task(gcal_event_ids=["ev_1", "ev_2"])
+        assert t2.gcal_event_id == "ev_1"
+        t2.gcal_event_id = "ev_replaced"
+        assert t2.gcal_event_ids == ["ev_replaced"]
+
+
+class TestP1ScheduledDeadlineVerification:
+    """P1: Verify scheduled blocks against deadlines normalized to Africa/Cairo."""
+
+    def test_scheduled_task_missing_local_deadline_sets_infeasible(self):
+        # Task pinned from 18:00 to 19:00 but deadline is 17:00 same day
+        t_late = _make_task(
+            task_id="t_late",
+            title="Late Task",
+            estimated_mins=60,
+            deadline="2026-11-02T17:00:00",
+            pinned_start="18:00",
+            pinned_end="19:00",
+        )
+        req = _make_request(
+            tasks=[t_late],
+            target_date="2026-11-02",
+            adaptive_overrides={"effective_focus_duration_mins": 60},
+        )
+        res = optimize_schedule(req)
+        assert len(res.scheduled_blocks) == 1
+        assert res.is_feasible is False
+        assert res.feasibility_flags is not None
+        violations = res.feasibility_flags["deadline_violations"]
+        assert len(violations) == 1
+        assert violations[0]["task_id"] == "t_late"
+        assert violations[0]["scheduled_end"] == "19:00"
+
+    def test_utc_z_deadline_normalized_to_cairo_timezone(self):
+        # 16:30 UTC == 18:30 Africa/Cairo (UTC+2 in November)
+        # Task runs 18:00-19:00 Cairo time -> ends 30 mins after 18:30 -> late!
+        t_utc_late = _make_task(
+            task_id="t_utc_late",
+            title="UTC Late Task",
+            estimated_mins=60,
+            deadline="2026-11-02T16:30:00Z",
+            pinned_start="18:00",
+            pinned_end="19:00",
+        )
+        res_late = optimize_schedule(
+            _make_request(
+                tasks=[t_utc_late],
+                target_date="2026-11-02",
+                adaptive_overrides={"effective_focus_duration_mins": 60},
+            )
+        )
+        assert res_late.is_feasible is False
+        assert res_late.feasibility_flags["deadline_violations"][0]["task_id"] == "t_utc_late"
+
+        # 17:00 UTC == 19:00 Africa/Cairo -> ending at 19:00 meets deadline cleanly
+        t_utc_ok = _make_task(
+            task_id="t_utc_ok",
+            title="UTC On-Time Task",
+            estimated_mins=60,
+            deadline="2026-11-02T17:00:00Z",
+            pinned_start="18:00",
+            pinned_end="19:00",
+        )
+        res_ok = optimize_schedule(
+            _make_request(
+                tasks=[t_utc_ok],
+                target_date="2026-11-02",
+                adaptive_overrides={"effective_focus_duration_mins": 60},
+            )
+        )
+        assert res_ok.is_feasible is True
+        assert res_ok.feasibility_flags is None
+
+    def test_date_only_deadline_treated_as_end_of_day(self):
+        # Date-only deadline 2026-11-02 means 23:59:59 Africa/Cairo
+        t_same_day = _make_task(
+            task_id="t_same_day",
+            title="Same Day Task",
+            estimated_mins=60,
+            deadline="2026-11-02",
+            pinned_start="21:00",
+            pinned_end="22:00",
+        )
+        res_ok = optimize_schedule(
+            _make_request(
+                tasks=[t_same_day],
+                target_date="2026-11-02",
+                adaptive_overrides={"effective_focus_duration_mins": 60},
+            )
+        )
+        assert res_ok.is_feasible is True
+
+        # Scheduled on 2026-11-03 after a 2026-11-02 date-only deadline -> infeasible
+        t_past_date = _make_task(
+            task_id="t_past_date",
+            title="Past Date Deadline Task",
+            estimated_mins=60,
+            deadline="2026-11-02",
+        )
+        res_fail = optimize_schedule(
+            _make_request(
+                tasks=[t_past_date],
+                target_date="2026-11-03",
+                adaptive_overrides={"effective_focus_duration_mins": 60},
+            )
+        )
+        assert len(res_fail.scheduled_blocks) == 1
+        assert res_fail.is_feasible is False
+        assert res_fail.feasibility_flags["deadline_violations"][0]["task_id"] == "t_past_date"

@@ -6,6 +6,7 @@ available.  Falls back to a deterministic splitter for offline / CI testing.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import List, Optional
 
@@ -13,6 +14,8 @@ from pydantic import BaseModel, Field
 
 from app import config
 from app.schema import StudyTask
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -83,24 +86,8 @@ def _llm_deconstruct(
     from langchain_google_genai import ChatGoogleGenerativeAI
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    model_name = getattr(config, "GEMINI_MODEL_NAME", "gemini-3.5-flash")
-    try:
-        llm = ChatGoogleGenerativeAI(
-            model=model_name,
-            google_api_key=config.GEMINI_API_KEY,
-            timeout=15,
-            max_retries=1,
-        )
-        structured_llm = llm.with_structured_output(DeconstructionResult)
-    except Exception:
-        fallback_model = "gemini-3.8-flash" if model_name != "gemini-3.8-flash" else "gemini-3.5-flash"
-        llm = ChatGoogleGenerativeAI(
-            model=fallback_model,
-            google_api_key=config.GEMINI_API_KEY,
-            timeout=15,
-            max_retries=1,
-        )
-        structured_llm = llm.with_structured_output(DeconstructionResult)
+    if not config.can_invoke_llm(ChatGoogleGenerativeAI):
+        raise RuntimeError("LLM invocation disabled (missing API key or unmocked test run)")
 
     system_prompt = (
         "You are a study planning assistant. Your job is to break a large "
@@ -125,15 +112,30 @@ def _llm_deconstruct(
         f"  Focus session limit: {focus_duration_mins} minutes\n"
     )
 
-    result: DeconstructionResult = structured_llm.invoke(
-        [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
-    )
+    candidate_models = config.get_gemini_candidate_models()
+    last_exc: Optional[Exception] = None
+    for candidate_model in candidate_models:
+        try:
+            llm = ChatGoogleGenerativeAI(
+                model=candidate_model,
+                google_api_key=config.GEMINI_API_KEY,
+                timeout=15,
+                max_retries=1,
+            )
+            structured_llm = llm.with_structured_output(DeconstructionResult)
+            result: DeconstructionResult = structured_llm.invoke(
+                [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+            )
+            # Ensure parent fields are set correctly regardless of LLM output
+            result.parent_task_id = task.task_id
+            result.parent_title = task.title
+            return result
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("LLM deconstruction failed for model %s: %s", candidate_model, exc)
+            continue
 
-    # Ensure parent fields are set correctly regardless of LLM output
-    result.parent_task_id = task.task_id
-    result.parent_title = task.title
-
-    return result
+    raise RuntimeError(f"All Gemini models failed during deconstruction: {last_exc}")
 
 
 # ---------------------------------------------------------------------------

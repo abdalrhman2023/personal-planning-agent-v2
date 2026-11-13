@@ -13,21 +13,54 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from app import config
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants & Config Resolution
 # ---------------------------------------------------------------------------
 
 _ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_CREDENTIALS_PATH = os.path.join(_ROOT_DIR, "credentials.json")
-_TOKEN_PATH = os.path.join(_ROOT_DIR, "token.json")
 _SCOPES = ["https://www.googleapis.com/auth/calendar"]
 _CALENDAR_ID = "primary"
+_HTTP_TIMEOUT_SECS = 10
+
+
+def _resolve_config_path(raw_path: str) -> str:
+    """Resolve config file paths relative to repository root when not absolute."""
+    if os.path.isabs(raw_path):
+        return raw_path
+    return os.path.join(_ROOT_DIR, raw_path)
+
+
+def _get_credentials_path() -> str:
+    return _resolve_config_path(getattr(config, "GOOGLE_CREDENTIALS_PATH", "credentials.json"))
+
+
+def _get_token_path() -> str:
+    return _resolve_config_path(getattr(config, "GOOGLE_TOKEN_PATH", "token.json"))
+
+
+# Backward-compatible module constants resolved from config.py
+_CREDENTIALS_PATH = _get_credentials_path()
+_TOKEN_PATH = _get_token_path()
+
+
+def _date_bounds_rfc3339(date: str) -> Tuple[str, str, ZoneInfo | timezone, str]:
+    """Return local day start/end RFC3339 bounds and ZoneInfo for *date*."""
+    tz_name = getattr(config, "TIMEZONE", "Africa/Cairo")
+    try:
+        tz: ZoneInfo | timezone = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+        tz_name = "UTC"
+
+    start_dt = datetime.fromisoformat(f"{date}T00:00:00").replace(tzinfo=tz)
+    end_dt = datetime.fromisoformat(f"{date}T23:59:59").replace(tzinfo=tz)
+    return start_dt.isoformat(), end_dt.isoformat(), tz, tz_name
 
 
 # ---------------------------------------------------------------------------
@@ -45,9 +78,10 @@ class GoogleCalendarService:
     """
 
     def __init__(self, credentials_path: Optional[str] = None) -> None:
-        self._credentials_path = credentials_path or _CREDENTIALS_PATH
+        self._credentials_path = credentials_path or _get_credentials_path()
+        self._token_path = _get_token_path()
         has_creds = os.path.isfile(self._credentials_path)
-        has_token = os.path.isfile(_TOKEN_PATH)
+        has_token = os.path.isfile(self._token_path)
 
         if credentials_path is not None:
             # Explicit credentials path passed (e.g. from tests)
@@ -76,29 +110,37 @@ class GoogleCalendarService:
     def _get_service(self) -> Any:
         """Return an authenticated ``googleapiclient.discovery.Resource``.
 
-        Performs token loading/refresh with socket timeouts; never blocks on
-        interactive local servers during background requests.
+        Uses a scoped ``httplib2.Http(timeout=10)`` transport instead of mutating
+        process-wide socket defaults, and never blocks on interactive local OAuth.
         """
         if self._service is not None:
             return self._service
 
+        import httplib2
+        import google_auth_httplib2
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import Request
         from googleapiclient.discovery import build
 
-        creds: Optional[Credentials] = None
+        class _TimeoutRequest(Request):
+            def __call__(self, *args: Any, **kwargs: Any) -> Any:
+                kwargs.setdefault("timeout", _HTTP_TIMEOUT_SECS)
+                return super().__call__(*args, **kwargs)
 
-        if os.path.isfile(_TOKEN_PATH):
+        creds: Optional[Credentials] = None
+        token_path = self._token_path
+
+        if os.path.isfile(token_path):
             try:
-                creds = Credentials.from_authorized_user_file(_TOKEN_PATH, _SCOPES)
+                creds = Credentials.from_authorized_user_file(token_path, _SCOPES)
             except Exception:
                 creds = None
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 try:
-                    creds.refresh(Request())
-                    with open(_TOKEN_PATH, "w") as token_file:
+                    creds.refresh(_TimeoutRequest())
+                    with open(token_path, "w", encoding="utf-8") as token_file:
                         token_file.write(creds.to_json())
                 except Exception:
                     self._mock_mode = True
@@ -109,9 +151,10 @@ class GoogleCalendarService:
                 return None
 
         if creds and creds.valid:
-            import socket
-            socket.setdefaulttimeout(10)
-            self._service = build("calendar", "v3", credentials=creds)
+            authed_http = google_auth_httplib2.AuthorizedHttp(
+                creds, http=httplib2.Http(timeout=_HTTP_TIMEOUT_SECS)
+            )
+            self._service = build("calendar", "v3", http=authed_http)
             return self._service
 
         self._mock_mode = True
@@ -137,18 +180,12 @@ class GoogleCalendarService:
         if self._mock_mode or service is None:
             return self._mock_get_busy_blocks(date)
 
-        tz_name = getattr(config, "TIMEZONE", "Africa/Cairo")
-        try:
-            tz = ZoneInfo(tz_name)
-        except Exception:
-            tz = None
-
-        time_min = f"{date}T00:00:00Z"
-        time_max = f"{date}T23:59:59Z"
+        time_min, time_max, tz, tz_name = _date_bounds_rfc3339(date)
 
         body = {
             "timeMin": time_min,
             "timeMax": time_max,
+            "timeZone": tz_name,
             "items": [{"id": calendar_id}],
         }
 
@@ -160,9 +197,8 @@ class GoogleCalendarService:
             for entry in busy_list:
                 start_dt = datetime.fromisoformat(entry["start"].replace("Z", "+00:00"))
                 end_dt = datetime.fromisoformat(entry["end"].replace("Z", "+00:00"))
-                if tz:
-                    start_dt = start_dt.astimezone(tz)
-                    end_dt = end_dt.astimezone(tz)
+                start_dt = start_dt.astimezone(tz)
+                end_dt = end_dt.astimezone(tz)
                 blocks.append({
                     "start": start_dt.strftime("%H:%M"),
                     "end": end_dt.strftime("%H:%M"),
@@ -260,10 +296,13 @@ class GoogleCalendarService:
         service = self._get_service()
         if self._mock_mode or service is None:
             return self._mock_delete_event(event_id)
-        service.events().delete(
-            calendarId=calendar_id, eventId=event_id
-        ).execute()
-        return True
+        try:
+            service.events().delete(
+                calendarId=calendar_id, eventId=event_id
+            ).execute()
+            return True
+        except Exception:
+            return False
 
     # -----------------------------------------------------------------------
     # 5. clear_events_for_date
@@ -289,13 +328,16 @@ class GoogleCalendarService:
         if self._mock_mode or service is None:
             return 0
 
-        time_min = f"{date}T00:00:00Z"
-        time_max = f"{date}T23:59:59Z"
-        events_result = (
-            service.events()
-            .list(calendarId=calendar_id, timeMin=time_min, timeMax=time_max, singleEvents=True)
-            .execute()
-        )
+        time_min, time_max, _tz, _tz_name = _date_bounds_rfc3339(date)
+        try:
+            events_result = (
+                service.events()
+                .list(calendarId=calendar_id, timeMin=time_min, timeMax=time_max, singleEvents=True)
+                .execute()
+            )
+        except Exception:
+            return 0
+
         items = events_result.get("items", [])
         deleted = 0
         for item in items:

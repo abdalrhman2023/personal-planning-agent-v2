@@ -8,17 +8,17 @@ Exposes the following endpoints:
 
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, List, Optional
+import logging
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.agent.graph import PlanningState, build_graph
-from app.engine.optimizer import optimize_schedule as run_optimizer
+from app.agent.graph import build_graph
+from app.config import get_today_date_str
+from app.engine.pipeline import execute_planning_pipeline
 from app.engine.telemetry import compute_outbound_signals
-from app.integrations.gcal_service import GoogleCalendarService
 from app.schema import (
     AdaptiveModelContext,
     FixedLecture,
@@ -29,6 +29,7 @@ from app.schema import (
     StudyTask,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/planning", tags=["planning"])
 
 
@@ -41,6 +42,7 @@ class OptimizeResponse(BaseModel):
     scheduled_blocks: List[ScheduledBlock] = Field(default_factory=list)
     unscheduled_tasks: List[str] = Field(default_factory=list)
     feasibility_flags: Optional[dict] = None
+    tasks: List[StudyTask] = Field(default_factory=list)
     schedule_result: Optional[ScheduleResult] = None
     outbound_signals: Optional[OutboundSignals] = None
     gcal_events: List[Dict[str, Any]] = Field(default_factory=list)
@@ -48,12 +50,12 @@ class OptimizeResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = "Please schedule a 25-minute study block for Algorithms today"
-    target_date: Optional[str] = "2026-11-02"
+    target_date: Optional[str] = Field(default_factory=get_today_date_str)
     tasks: List[StudyTask] = Field(default_factory=list)
     university_schedule: List[FixedLecture] = Field(default_factory=list)
     gcal_busy_blocks: List[Dict[str, str]] = Field(default_factory=list)
     adaptive_model: AdaptiveModelContext = Field(default_factory=AdaptiveModelContext)
-    entry_mode: Optional[str] = None  # "chat" or "control_signal"
+    entry_mode: Optional[Literal["chat", "control_signal", ""]] = None
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -96,7 +98,7 @@ class ChatResponse(BaseModel):
 
 
 class TelemetryRequest(BaseModel):
-    target_date: str = "2026-11-02"
+    target_date: str = Field(default_factory=get_today_date_str)
     scheduled_blocks: List[ScheduledBlock] = Field(default_factory=list)
     tasks: List[StudyTask] = Field(default_factory=list)
     university_schedule: List[FixedLecture] = Field(default_factory=list)
@@ -141,54 +143,35 @@ class TelemetryRequest(BaseModel):
 
 @router.post("/optimize", response_model=OptimizeResponse)
 def optimize_schedule_endpoint(request: ScheduleRequest) -> OptimizeResponse:
-    """Run the deterministic scheduler for target_date and sync to Google Calendar."""
-    # 1. Deterministic Optimization
-    result = run_optimizer(request)
+    """Run the unified planning pipeline for target_date and sync to Google Calendar."""
+    try:
+        pipeline_res = execute_planning_pipeline(
+            target_date=request.target_date,
+            tasks=request.tasks,
+            university_schedule=request.university_schedule,
+            gcal_busy_blocks=request.gcal_busy_blocks,
+            adaptive_model=request.adaptive_model,
+        )
+        sr = pipeline_res.schedule_result
 
-    # 2. Calendar Event Creation (Safe in both Mock and Live mode)
-    gcal = GoogleCalendarService()
-
-    # Clean up previous gcal_event_ids present on tasks to prevent duplicates
-    for task in request.tasks:
-        if task.gcal_event_id:
-            try:
-                gcal.delete_calendar_event(task.gcal_event_id)
-            except Exception:
-                pass
-
-    gcal_events: List[Dict[str, Any]] = []
-    for block in result.scheduled_blocks:
-        try:
-            event = gcal.create_calendar_event(
-                summary=f"Study: {block.title}",
-                date=block.date,
-                start_time=block.start,
-                end_time=block.end,
-                description=f"Task ID: {block.task_id} (Part {block.part})",
-            )
-            gcal_events.append(event)
-        except Exception:
-            pass
-
-    # 3. Compute Outbound Signals
-    signals = compute_outbound_signals(
-        scheduled_blocks=result.scheduled_blocks,
-        tasks=request.tasks,
-        university_schedule=request.university_schedule,
-        gcal_busy_blocks=request.gcal_busy_blocks,
-        target_date=request.target_date,
-        feasibility_flags=result.feasibility_flags,
-    )
-
-    return OptimizeResponse(
-        is_feasible=result.is_feasible,
-        scheduled_blocks=result.scheduled_blocks,
-        unscheduled_tasks=result.unscheduled_tasks,
-        feasibility_flags=result.feasibility_flags,
-        schedule_result=result,
-        outbound_signals=signals,
-        gcal_events=gcal_events,
-    )
+        return OptimizeResponse(
+            is_feasible=sr.is_feasible,
+            scheduled_blocks=sr.scheduled_blocks,
+            unscheduled_tasks=sr.unscheduled_tasks,
+            feasibility_flags=sr.feasibility_flags,
+            tasks=pipeline_res.updated_tasks,
+            schedule_result=sr,
+            outbound_signals=pipeline_res.outbound_signals,
+            gcal_events=pipeline_res.gcal_events,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unhandled error in /api/v1/planning/optimize")
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred while optimizing the schedule.",
+        )
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -199,7 +182,7 @@ def chat_endpoint(request: ChatRequest) -> ChatResponse:
         initial_state = {
             "messages": [HumanMessage(content=request.message)],
             "entry_mode": request.entry_mode or "",
-            "target_date": request.target_date or "",
+            "target_date": request.target_date or get_today_date_str(),
             "tasks": [t.model_dump() for t in request.tasks],
             "university_schedule": [l.model_dump() for l in request.university_schedule],
             "gcal_busy_blocks": request.gcal_busy_blocks,
@@ -208,17 +191,20 @@ def chat_endpoint(request: ChatRequest) -> ChatResponse:
 
         final_state = graph.invoke(initial_state)
 
-        # Extract reply message
+        # Extract clean AI reply messages (never leak raw ToolMessage JSON)
         response_text = final_state.get("response_text", "")
         messages = final_state.get("messages", [])
-        if messages:
-            last_msg = messages[-1]
-            if hasattr(last_msg, "content") and last_msg.content:
-                msg_content = str(last_msg.content)
-                if response_text:
-                    response_text = f"{msg_content}\n\n[Telemetry] {response_text}"
-                else:
-                    response_text = msg_content
+        ai_contents = [
+            str(m.content).strip()
+            for m in messages
+            if isinstance(m, AIMessage) and getattr(m, "content", None) and str(m.content).strip()
+        ]
+        if ai_contents:
+            msg_content = "\n".join(dict.fromkeys(ai_contents))
+            if response_text:
+                response_text = f"{msg_content}\n\n[Telemetry] {response_text}"
+            else:
+                response_text = msg_content
 
         updated_tasks = [StudyTask(**t) for t in final_state.get("tasks", [])]
         raw_sr = final_state.get("schedule_result")
@@ -235,19 +221,34 @@ def chat_endpoint(request: ChatRequest) -> ChatResponse:
             outbound_signals=outbound_signals,
             gcal_events=final_state.get("gcal_events_created", []),
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unhandled error in /api/v1/planning/chat")
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred while processing the chat request.",
+        )
 
 
 @router.post("/telemetry", response_model=OutboundSignals)
 def telemetry_endpoint(request: TelemetryRequest) -> OutboundSignals:
     """Generate telemetry metrics, velocity slip analysis, and study block invitations."""
-    signals = compute_outbound_signals(
-        scheduled_blocks=request.scheduled_blocks,
-        tasks=request.tasks,
-        university_schedule=request.university_schedule,
-        gcal_busy_blocks=request.gcal_busy_blocks,
-        target_date=request.target_date,
-        feasibility_flags=request.feasibility_flags,
-    )
-    return signals
+    try:
+        signals = compute_outbound_signals(
+            scheduled_blocks=request.scheduled_blocks,
+            tasks=request.tasks,
+            university_schedule=request.university_schedule,
+            gcal_busy_blocks=request.gcal_busy_blocks,
+            target_date=request.target_date,
+            feasibility_flags=request.feasibility_flags,
+        )
+        return signals
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unhandled error in /api/v1/planning/telemetry")
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred while computing telemetry signals.",
+        )

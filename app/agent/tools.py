@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
 from langchain_core.tools import tool
 
@@ -19,11 +19,9 @@ from app.schema import (
     FixedLecture,
     ScheduleRequest,
     ScheduleResult,
-    ScheduledBlock,
     StudyTask,
 )
 from app.engine.optimizer import optimize_schedule as run_optimizer
-from app.integrations.gcal_service import GoogleCalendarService
 
 
 # ---------------------------------------------------------------------------
@@ -87,10 +85,11 @@ def reschedule_block(
     new_end: str,
     new_date: Optional[str] = None,
 ) -> str:
-    """Reschedule a study block to a new time slot.
+    """Reschedule a study block to a hard-pinned time slot.
 
-    Returns a JSON object describing the rescheduled block.  The actual
-    calendar update and conflict validation happen in the execution node.
+    Returns a JSON payload instructing the execution node to set
+    ``pinned_start``/``pinned_end`` and reset the task status to ``"pending"``
+    so the deterministic optimizer re-places it and updates Google Calendar.
 
     Parameters
     ----------
@@ -109,6 +108,9 @@ def reschedule_block(
         "new_start": new_start,
         "new_end": new_end,
         "new_date": new_date,
+        "pinned_start": new_start,
+        "pinned_end": new_end,
+        "status": "pending",
     })
 
 
